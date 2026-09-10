@@ -38,7 +38,7 @@ internal class EnvironmentRepositoryRuntime(
     private val reportRoot: File,
     private val provisioningState: ProvisioningState,
     private val env: Map<String, String> = System.getenv(),
-    private val timeoutMillis: Long = DEFAULT_TIMEOUT_MILLIS,
+    private val timeoutMillis: Long = resolveTimeoutMillis(env),
 ) {
     fun execute(
         spec: ValidationNodeSpec,
@@ -264,7 +264,10 @@ internal class EnvironmentRepositoryRuntime(
             .also { it.environment().putAll(environment) }
         if (stderrLog != null) builder.redirectError(stderrLog)
         val process = builder.start()
-        val outcome = awaitWithTimeout(process, timeoutMillis, managedCommand)
+        // Per-command budget: a cluster-creating `tofu apply` is not the same
+        // shape of work as a `git clone`, and the caller knows which it is.
+        val commandTimeoutMillis = resolveCommandTimeoutMillis(env, label, timeoutMillis)
+        val outcome = awaitWithTimeout(process, commandTimeoutMillis, managedCommand)
         val finished = outcome !is ExecutionOutcome.TimedOut
         val exitCode = when (outcome) {
             is ExecutionOutcome.Completed -> outcome.exitCode
@@ -273,7 +276,12 @@ internal class EnvironmentRepositoryRuntime(
         }
         val record = EnvironmentRepositoryCommandRecord(label, argv, exitCode, log, stderrLog)
         if (!finished) {
-            error("environmentRepository command '$label' timed out after ${timeoutMillis}ms; see ${commandLogReference(record)}")
+            error(
+                "environmentRepository command '$label' timed out after ${commandTimeoutMillis}ms; " +
+                    "see ${commandLogReference(record)}. Raise it with " +
+                    "${commandTimeoutEnvName(label)} or $TIMEOUT_ENV (seconds) when this command " +
+                    "legitimately takes longer -- provisioning a Kubernetes cluster commonly does."
+            )
         }
         if (outcome is ExecutionOutcome.ProcessContractViolation) {
             error("environmentRepository command '$label' violated the process contract: " +
@@ -299,7 +307,34 @@ internal class EnvironmentRepositoryRuntime(
     }
 
     companion object {
+        // 5 minutes was a single hard-coded budget for every environment-repository
+        // command. It is shorter than the cluster-creation budget consuming
+        // repositories declare for the very same `tofu apply` -- deploy-helm passes
+        // HELM_DEPLOY_COMMAND_TIMEOUT_SECONDS=720 -- so a graph could not provision
+        // its own environment on any machine where k3d takes over five minutes, and
+        // the apply was killed while still making progress. Two timeouts for one
+        // operation disagreeing by more than a factor of two is a contract problem,
+        // not a machine-speed problem, so the budget is now configurable and can be
+        // set per command.
         private const val DEFAULT_TIMEOUT_MILLIS = 5 * 60 * 1000L
+        internal const val TIMEOUT_ENV = "TEST_GRAPH_ENVIRONMENT_COMMAND_TIMEOUT_SECONDS"
+
+        /** Per-command override, e.g. TEST_GRAPH_ENVIRONMENT_TIMEOUT_SECONDS_TOFU_APPLY. */
+        internal fun commandTimeoutEnvName(label: String): String =
+            "TEST_GRAPH_ENVIRONMENT_TIMEOUT_SECONDS_" +
+                label.uppercase().replace(Regex("[^A-Z0-9]+"), "_").trim('_')
+
+        private fun secondsToMillis(raw: String?): Long? =
+            raw?.trim()?.takeIf { it.isNotEmpty() }?.toLongOrNull()?.takeIf { it > 0 }?.times(1000L)
+
+        internal fun resolveTimeoutMillis(env: Map<String, String>): Long =
+            secondsToMillis(env[TIMEOUT_ENV]) ?: DEFAULT_TIMEOUT_MILLIS
+
+        internal fun resolveCommandTimeoutMillis(
+            env: Map<String, String>,
+            label: String,
+            fallbackMillis: Long,
+        ): Long = secondsToMillis(env[commandTimeoutEnvName(label)]) ?: fallbackMillis
         private val ENVIRONMENT_REPOSITORY_ACTIONS = setOf("provision", "reuse", "deploy", "reset", "destroy")
         private val EXISTING_ENVIRONMENT_ACTIONS = setOf("reuse", "deploy", "reset", "destroy")
     }
